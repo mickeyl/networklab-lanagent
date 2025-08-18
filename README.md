@@ -25,7 +25,7 @@ pip install lanagent
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/lanagent.git
+git clone https://github.com/mickeyl/networklab-lanagent.git
 cd lanagent
 pip install -e .
 ```
