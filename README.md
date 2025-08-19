@@ -16,6 +16,14 @@ LANAgent is a lightweight network discovery service that scans your local networ
 
 ## Installation
 
+### Using pipx (Recommended)
+
+Install directly from GitHub using pipx for isolated environment:
+
+```bash
+pipx install git+https://github.com/mickeyl/networklab-lanagent
+```
+
 ### From PyPI (when published)
 
 ```bash
