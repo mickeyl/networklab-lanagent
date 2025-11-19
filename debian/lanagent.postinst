@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        if ! getent passwd lanagent >/dev/null 2>&1; then
+            adduser --quiet --system --group --home /var/lib/lanagent --shell /usr/sbin/nologin --gecos "LANAgent service user" lanagent
+        fi
+        install -d -o lanagent -g lanagent -m 0750 /var/lib/lanagent
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        ;;
+fi
+
+#DEBHELPER#

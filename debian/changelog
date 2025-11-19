@@ -1,0 +1,5 @@
+lanagent (0.1.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging for LANAgent with systemd integration.
+
+ -- Dr. Mickey Lauer <mickey@example.com>  Wed, 19 Nov 2025 09:38:14 +0100

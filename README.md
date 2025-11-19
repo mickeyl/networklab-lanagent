@@ -184,6 +184,37 @@ python -m pytest tests/
 python -m build
 ```
 
+## Running Under systemd
+
+The repository ships with a hardened systemd unit that runs LANAgent as the dedicated `lanagent` user.
+
+1. Install the Python package (e.g. `pip install .` or via the Debian package described below).
+2. Deploy the service unit and default configuration:
+   ```bash
+   sudo ./scripts/install-systemd.sh
+   ```
+3. Adjust `/etc/lanagent/lanagent.conf` if you need to pin the HTTP port (defaults to automatic port selection).
+4. Check the status via `systemctl status lanagent` and view logs via `journalctl -u lanagent`.
+
+The unit file lives in `systemd/lanagent.service` if you want to customize hardening directives or add more environment variables.
+
+## Building a Debian Package
+
+Basic packaging metadata lives in the `debian/` directory so you can build a `.deb` directly from this repository.
+
+1. Install the build toolchain and dependencies:
+   ```bash
+   sudo apt update
+   sudo apt install build-essential debhelper dh-python python3-all python3-setuptools
+   ```
+2. Build the package:
+   ```bash
+   dpkg-buildpackage -us -uc
+   ```
+3. Install the resulting package from the parent directory (for example `sudo dpkg -i ../lanagent_0.1.0-1_all.deb`).
+
+The Debian package automatically installs and enables the systemd service, creates the `lanagent` system user, and drops a configurable `/etc/lanagent/lanagent.conf`.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

@@ -1,0 +1,31 @@
+[Unit]
+Description=LANAgent network discovery service
+Documentation=https://github.com/yourusername/lanagent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lanagent
+Group=lanagent
+WorkingDirectory=/var/lib/lanagent
+ExecStart=/usr/bin/lanagent --port ${LANAGENT_PORT}
+Environment=LANAGENT_PORT=0
+EnvironmentFile=-/etc/lanagent/lanagent.conf
+Restart=on-failure
+RestartSec=5
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+PrivateTmp=yes
+PrivateDevices=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

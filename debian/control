@@ -1,0 +1,21 @@
+Source: lanagent
+Section: net
+Priority: optional
+Maintainer: Dr. Mickey Lauer <mickey@example.com>
+Build-Depends: debhelper-compat (= 13),
+               dh-python,
+               python3-all,
+               python3-setuptools,
+               python3-wheel
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/yourusername/lanagent
+
+Package: lanagent
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends}, python3-zeroconf, python3-netifaces
+Description: LANAgent network discovery service
+ LANAgent scans the local layer-2 network, exposes the collected MAC/IP
+ mappings through a JSON API and advertises itself via Zeroconf/mDNS. The
+ package ships with an optional systemd service that keeps the scanner
+ running continuously and publishes results on the configured port.
