@@ -5,14 +5,18 @@ Exposes network scan results via JSON API and publishes via Zeroconf
 """
 
 import json
+import logging
 import socket
 import struct
 import subprocess
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
+
+log = logging.getLogger("lanagent")
 
 try:
     from zeroconf import ServiceInfo, Zeroconf
@@ -34,13 +38,39 @@ class ARPScanner:
         self.lock = threading.Lock()
         
     def get_local_network(self) -> Optional[Tuple[str, str]]:
-        """Get the local network address and netmask"""
-        for interface in netifaces.interfaces():
-            addrs = netifaces.ifaddresses(interface)
-            if netifaces.AF_INET in addrs:
-                for addr in addrs[netifaces.AF_INET]:
-                    if 'addr' in addr and addr['addr'] != '127.0.0.1':
-                        return addr['addr'], addr.get('netmask', '255.255.255.0')
+        """Get the local network address and netmask from the default-route interface.
+
+        Anchoring on the default route avoids picking up docker/bridge/VPN
+        interfaces that happen to sort earlier than the real LAN NIC.
+        """
+        default_iface = None
+        try:
+            gws = netifaces.gateways()
+            default = gws.get('default', {}).get(netifaces.AF_INET)
+            if default:
+                default_iface = default[1]
+        except Exception as e:
+            log.warning("Could not determine default route: %s", e)
+
+        candidates = [default_iface] if default_iface else []
+        for iface in netifaces.interfaces():
+            if iface == default_iface:
+                continue
+            if iface.startswith(('lo', 'docker', 'br-', 'veth', 'tun', 'tap', 'wg')):
+                continue
+            candidates.append(iface)
+
+        for iface in candidates:
+            if not iface:
+                continue
+            try:
+                addrs = netifaces.ifaddresses(iface)
+            except ValueError:
+                continue
+            for addr in addrs.get(netifaces.AF_INET, []):
+                ip = addr.get('addr')
+                if ip and ip != '127.0.0.1':
+                    return ip, addr.get('netmask', '255.255.255.0')
         return None
     
     def get_local_machine_info(self) -> Optional[Dict[str, str]]:
@@ -97,19 +127,17 @@ class ARPScanner:
     
     def ping_ip(self, ip: str) -> bool:
         """Ping an IP to populate ARP cache"""
+        if sys.platform == "darwin":
+            cmd = ["ping", "-c", "1", "-W", "1", "-t", "1", ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", "1", ip]
         try:
-            # Use different ping command based on OS
-            if sys.platform == "darwin":  # macOS
-                cmd = ["ping", "-c", "1", "-W", "1", "-t", "1", ip]
-            else:  # Linux
-                cmd = ["ping", "-c", "1", "-W", "1", ip]
-            
-            result = subprocess.run(cmd, 
-                                  stdout=subprocess.DEVNULL, 
+            result = subprocess.run(cmd,
+                                  stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL,
                                   timeout=2)
             return result.returncode == 0
-        except:
+        except (subprocess.TimeoutExpired, OSError):
             return False
     
     def parse_arp_output(self, output: str) -> List[Dict[str, str]]:
@@ -162,28 +190,20 @@ class ARPScanner:
             return []
         
         local_ip, netmask = network_info
-        ips = self.get_network_range(local_ip, netmask)
-        
-        # Limit scan to first 254 hosts for performance
-        ips = ips[:254]
-        
-        # Ping IPs in parallel to populate ARP cache
-        threads = []
-        for ip in ips:
-            t = threading.Thread(target=self.ping_ip, args=(ip,))
-            t.daemon = True
-            t.start()
-            threads.append(t)
-            
-            # Limit concurrent threads
-            if len(threads) >= 50:
-                for t in threads:
-                    t.join(timeout=0.1)
-                threads = []
-        
-        # Wait for remaining threads
-        for t in threads:
-            t.join(timeout=0.1)
+        all_ips = self.get_network_range(local_ip, netmask)
+
+        # Cap scan size; warn so users know when they're on a larger subnet
+        # than we cover (typical home /24 fits in 254).
+        SCAN_CAP = 254
+        if len(all_ips) > SCAN_CAP:
+            log.warning("Network %s/%s has %d hosts; scanning first %d only",
+                        local_ip, netmask, len(all_ips), SCAN_CAP)
+        ips = all_ips[:SCAN_CAP]
+
+        # Parallel pings with real bounded concurrency. shutdown(wait=True)
+        # ensures the ARP cache has had a chance to populate before we read it.
+        with ThreadPoolExecutor(max_workers=64, thread_name_prefix="ping") as pool:
+            list(pool.map(self.ping_ip, ips))
         
         # Get ARP table
         try:
@@ -273,7 +293,7 @@ class ARPScannerService:
             self.port = self.find_free_port()
         
         ScanHandler.scanner = self.scanner
-        self.server = HTTPServer(('0.0.0.0', self.port), ScanHandler)
+        self.server = ThreadingHTTPServer(('0.0.0.0', self.port), ScanHandler)
         
         print(f"HTTP server started on port {self.port}")
         print(f"Access the API at: http://0.0.0.0:{self.port}/scan")
@@ -320,15 +340,28 @@ class ARPScannerService:
         print(f"IP address: {local_ip}")
     
     def periodic_scan(self):
-        """Perform periodic network scans"""
+        """Perform periodic network scans.
+
+        Each iteration is wrapped so a transient failure (e.g. ``ip neigh``
+        missing, DNS hang) does not kill the worker thread and freeze the
+        cache forever.
+        """
         while True:
-            print("Performing network scan...")
-            devices = self.scanner.scan()
-            print(f"Found {len(devices)} devices")
-            time.sleep(60)  # Scan every minute
+            try:
+                log.info("Performing network scan...")
+                devices = self.scanner.scan()
+                log.info("Found %d devices", len(devices))
+            except Exception:
+                log.exception("Periodic scan failed; keeping previous cache")
+            time.sleep(60)
     
     def run(self):
         """Main service loop"""
+        if not logging.getLogger().handlers:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            )
         try:
             # Start HTTP server
             self.start_http_server()
