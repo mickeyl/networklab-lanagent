@@ -25,7 +25,8 @@ PrivateTmp=yes
 PrivateDevices=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-CapabilityBoundingSet=
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target

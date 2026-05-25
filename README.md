@@ -8,7 +8,7 @@ LANAgent is a lightweight network discovery service that scans your local networ
 ## Features
 
 - 🔍 **Network Discovery**: Automatically discovers devices on your local network using ARP
-- 🌐 **JSON API**: Simple HTTP endpoint to retrieve network scan results
+- 🌐 **JSON API**: HTTP endpoints for cached scans, forced scans, targeted MAC lookups, and health diagnostics
 - 📡 **Zeroconf/mDNS**: Automatic service discovery via Bonjour/Avahi
 - 🔄 **Periodic Scanning**: Continuously updates device list every 60 seconds
 - 🖥️ **Cross-Platform**: Works on macOS and Linux
@@ -66,12 +66,30 @@ The service will:
 3. Perform an initial network scan
 4. Continue scanning every 60 seconds
 
-### API Endpoint
+### API Endpoints
 
 Once running, access the scan results:
 
 ```bash
 curl http://localhost:<port>/scan
+```
+
+Force a fresh scan:
+
+```bash
+curl http://localhost:<port>/scan?force=1
+```
+
+Resolve one IP address immediately:
+
+```bash
+curl "http://localhost:<port>/lookup?ip=192.168.1.100"
+```
+
+Inspect the agent health and scan diagnostics:
+
+```bash
+curl http://localhost:<port>/health
 ```
 
 Response format:
@@ -86,9 +104,29 @@ Response format:
     },
     {
       "ip": "192.168.1.100",
-      "mac": "11:22:33:44:55:66"
+      "mac": "11:22:33:44:55:66",
+      "firstSeen": 1779700123.0,
+      "lastSeen": 1779700123.0,
+      "source": "scan"
     }
-  ]
+  ],
+  "diagnostics": {
+    "network": {
+      "ip": "192.168.1.20",
+      "netmask": "255.255.255.0",
+      "interface": "eth0"
+    },
+    "cacheSize": 5,
+    "cacheTTL": 1800,
+    "lastScan": {
+      "duration": 2.431,
+      "probed": 254,
+      "probeReplies": 42,
+      "neighbors": 5,
+      "method": "arping+neighbor"
+    },
+    "hasArping": true
+  }
 }
 ```
 
@@ -137,17 +175,18 @@ browser = ServiceBrowser(zeroconf, "_lanagent._tcp.local.", Listener())
 ## How It Works
 
 1. **Network Detection**: Identifies the local network interface and subnet
-2. **ARP Population**: Sends ICMP pings to all IPs in the subnet to populate the ARP cache
+2. **ARP Population**: Uses `arping` when available, falling back to ICMP ping, to populate the neighbor cache
 3. **ARP Table Reading**: 
    - On macOS: Uses `arp -a` command
    - On Linux: Uses `ip neigh show` command
-4. **Result Caching**: Maintains a thread-safe cache of discovered devices
-5. **API Serving**: Exposes results via HTTP with CORS enabled for web access
+4. **Targeted Lookup**: `/lookup?ip=...` actively probes one host before reading the neighbor cache
+5. **Result Caching**: Maintains a thread-safe TTL cache of discovered devices so transient weak scans do not erase recent MAC mappings
+6. **API Serving**: Exposes results via HTTP with CORS enabled for web access
 
 ## Platform Support
 
 - **macOS**: Full support using native `arp` and `ping` commands
-- **Linux**: Full support using `ip neigh` and `ping` commands
+- **Linux**: Full support using `ip neigh` and `arping` when installed, falling back to `ping`
 - **Windows**: Not currently supported (PRs welcome!)
 
 ## Security Considerations
@@ -197,6 +236,7 @@ The repository ships with a hardened systemd unit that runs LANAgent as the dedi
 4. Check the status via `systemctl status lanagent` and view logs via `journalctl -u lanagent`.
 
 The unit file lives in `systemd/lanagent.service` if you want to customize hardening directives or add more environment variables.
+It grants `CAP_NET_RAW` so `arping` can send raw ARP probes while the service continues to run as the dedicated `lanagent` user.
 
 ## Building a Debian Package
 

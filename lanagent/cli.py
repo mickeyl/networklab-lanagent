@@ -5,7 +5,15 @@ Command-line interface for LANAgent service.
 
 import argparse
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from .scanner import ARPScannerService
+
+
+def package_version() -> str:
+    try:
+        return version("lanagent")
+    except PackageNotFoundError:
+        return "0.0.0"
 
 
 def main():
@@ -37,7 +45,7 @@ The service will:
     parser.add_argument(
         '-v', '--version',
         action='version',
-        version='%(prog)s 0.1.0'
+        version=f'%(prog)s {package_version()}'
     )
     
     args = parser.parse_args()

@@ -6,6 +6,8 @@ Exposes network scan results via JSON API and publishes via Zeroconf
 
 import json
 import logging
+import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -15,6 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 log = logging.getLogger("lanagent")
 
@@ -34,10 +37,12 @@ class ARPScanner:
     """Handles ARP scanning to discover devices on the local network"""
     
     def __init__(self):
-        self.cache: List[Dict[str, str]] = []
+        self.cache: Dict[str, Dict[str, object]] = {}
+        self.last_scan: Optional[Dict[str, object]] = None
         self.lock = threading.Lock()
+        self.cache_ttl = 30 * 60
         
-    def get_local_network(self) -> Optional[Tuple[str, str]]:
+    def get_local_network(self) -> Optional[Tuple[str, str, str]]:
         """Get the local network address and netmask from the default-route interface.
 
         Anchoring on the default route avoids picking up docker/bridge/VPN
@@ -70,7 +75,7 @@ class ARPScanner:
             for addr in addrs.get(netifaces.AF_INET, []):
                 ip = addr.get('addr')
                 if ip and ip != '127.0.0.1':
-                    return ip, addr.get('netmask', '255.255.255.0')
+                    return ip, addr.get('netmask', '255.255.255.0'), iface
         return None
     
     def get_local_machine_info(self) -> Optional[Dict[str, str]]:
@@ -126,7 +131,7 @@ class ARPScanner:
         return ips
     
     def ping_ip(self, ip: str) -> bool:
-        """Ping an IP to populate ARP cache"""
+        """Ping an IP to populate ARP cache."""
         if sys.platform == "darwin":
             cmd = ["ping", "-c", "1", "-W", "1", "-t", "1", ip]
         else:
@@ -139,6 +144,53 @@ class ARPScanner:
             return result.returncode == 0
         except (subprocess.TimeoutExpired, OSError):
             return False
+
+    def arp_probe_device(self, ip: str, interface: Optional[str]) -> Optional[Dict[str, str]]:
+        """Actively probe one IPv4 address for a MAC address.
+
+        Prefer arping when available because ICMP can be filtered while ARP is
+        still answered on the local link. Fall back to ping so the agent remains
+        useful without extra privileges or packages.
+        """
+        arping = shutil.which("arping")
+        if arping:
+            cmd = [arping, "-c", "1", "-w", "1"]
+            if interface:
+                cmd.extend(["-I", interface])
+            cmd.append(ip)
+            try:
+                result = subprocess.run(cmd,
+                                      capture_output=True,
+                                      text=True,
+                                      timeout=2)
+                mac = self.parse_arping_mac(result.stdout)
+                if mac:
+                    return {"ip": ip, "mac": mac}
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        if self.ping_ip(ip):
+            return {"ip": ip, "mac": ""}
+
+        return None
+
+    def arp_probe_ip(self, ip: str, interface: Optional[str]) -> bool:
+        """Actively probe one IPv4 address, returning whether it answered."""
+        return self.arp_probe_device(ip, interface) is not None
+
+    def parse_arping_mac(self, output: str) -> Optional[str]:
+        """Extract a MAC address from common arping output formats."""
+        for match in re.finditer(r"\[([0-9A-Fa-f:]{11,17})\]", output):
+            mac = self.normalize_mac(match.group(1))
+            if mac:
+                return mac
+
+        for match in re.finditer(r"\b([0-9A-Fa-f]{1,2}(?::[0-9A-Fa-f]{1,2}){5})\b", output):
+            mac = self.normalize_mac(match.group(1))
+            if mac:
+                return mac
+
+        return None
     
     def parse_arp_output(self, output: str) -> List[Dict[str, str]]:
         """Parse ARP/ip neigh command output"""
@@ -151,9 +203,9 @@ class ARPScanner:
                 parts = line.split()
                 if len(parts) >= 4 and parts[2] == "at":
                     ip = parts[1].strip('()')
-                    mac = parts[3]
-                    if mac != "(incomplete)" and self.is_valid_mac(mac):
-                        devices.append({"ip": ip, "mac": mac.upper()})
+                    mac = self.normalize_mac(parts[3])
+                    if mac:
+                        devices.append({"ip": ip, "mac": mac})
             else:  # Linux ip neigh output
                 # Example: 192.168.1.1 dev eth0 lladdr aa:bb:cc:dd:ee:ff STALE
                 parts = line.split()
@@ -161,35 +213,87 @@ class ARPScanner:
                     ip = parts[0]
                     lladdr_idx = parts.index("lladdr")
                     if lladdr_idx + 1 < len(parts):
-                        mac = parts[lladdr_idx + 1]
-                        if self.is_valid_mac(mac):
-                            devices.append({"ip": ip, "mac": mac.upper()})
+                        mac = self.normalize_mac(parts[lladdr_idx + 1])
+                        if mac:
+                            devices.append({"ip": ip, "mac": mac})
         
         return devices
-    
-    def is_valid_mac(self, mac: str) -> bool:
-        """Validate MAC address format"""
+
+    def normalize_mac(self, mac: str) -> Optional[str]:
+        """Normalize MAC addresses, accepting macOS ARP's non-padded octets."""
         if mac == "(incomplete)" or mac == "<incomplete>":
-            return False
+            return None
+
         parts = mac.split(":")
         if len(parts) != 6:
-            return False
+            return None
+
+        normalized = []
         for part in parts:
-            if len(part) != 2:
-                return False
+            if not 1 <= len(part) <= 2:
+                return None
             try:
-                int(part, 16)
+                value = int(part, 16)
             except ValueError:
-                return False
-        return True
-    
-    def scan(self) -> List[Dict[str, str]]:
+                return None
+            normalized.append(f"{value:02X}")
+
+        return ":".join(normalized)
+
+    def is_valid_mac(self, mac: str) -> bool:
+        """Validate MAC address format"""
+        return self.normalize_mac(mac) is not None
+
+    def read_neighbor_table(self) -> List[Dict[str, str]]:
+        """Read the operating system's neighbor/ARP table."""
+        if sys.platform == "darwin":  # macOS
+            result = subprocess.run(["arp", "-a"],
+                                  capture_output=True,
+                                  text=True,
+                                  timeout=5)
+        else:  # Linux - use ip neigh instead of arp (no root required)
+            result = subprocess.run(["ip", "neigh", "show"],
+                                  capture_output=True,
+                                  text=True,
+                                  timeout=5)
+
+        if result.returncode != 0:
+            return []
+
+        return self.parse_arp_output(result.stdout)
+
+    def remember_devices(self, devices: List[Dict[str, str]], source: str) -> None:
+        """Merge scan results into the TTL cache."""
+        now = time.time()
+        with self.lock:
+            for device in devices:
+                cached = self.cache.get(device["ip"], {})
+                self.cache[device["ip"]] = {
+                    "ip": device["ip"],
+                    "mac": device["mac"],
+                    "firstSeen": cached.get("firstSeen", now),
+                    "lastSeen": now,
+                    "source": source,
+                }
+            self.expire_cache_locked(now)
+
+    def expire_cache_locked(self, now: Optional[float] = None) -> None:
+        now = now or time.time()
+        expired = [
+            ip for ip, device in self.cache.items()
+            if now - float(device.get("lastSeen", 0)) > self.cache_ttl
+        ]
+        for ip in expired:
+            self.cache.pop(ip, None)
+
+    def scan(self) -> List[Dict[str, object]]:
         """Perform ARP scan of the local network"""
+        started = time.time()
         network_info = self.get_local_network()
         if not network_info:
             return []
-        
-        local_ip, netmask = network_info
+
+        local_ip, netmask, interface = network_info
         all_ips = self.get_network_range(local_ip, netmask)
 
         # Cap scan size; warn so users know when they're on a larger subnet
@@ -202,45 +306,96 @@ class ARPScanner:
 
         # Parallel pings with real bounded concurrency. shutdown(wait=True)
         # ensures the ARP cache has had a chance to populate before we read it.
-        with ThreadPoolExecutor(max_workers=64, thread_name_prefix="ping") as pool:
-            list(pool.map(self.ping_ip, ips))
-        
+        with ThreadPoolExecutor(max_workers=64, thread_name_prefix="probe") as pool:
+            probe_results = list(pool.map(lambda ip: self.arp_probe_device(ip, interface), ips))
+
         # Get ARP table
         try:
-            if sys.platform == "darwin":  # macOS
-                result = subprocess.run(["arp", "-a"], 
-                                      capture_output=True, 
-                                      text=True, 
-                                      timeout=5)
-            else:  # Linux - use ip neigh instead of arp (no root required)
-                result = subprocess.run(["ip", "neigh", "show"], 
-                                      capture_output=True, 
-                                      text=True, 
-                                      timeout=5)
-            
-            if result.returncode == 0:
-                devices = self.parse_arp_output(result.stdout)
-                
-                # Add local machine to the results
-                local_info = self.get_local_machine_info()
-                if local_info:
-                    # Check if local machine is already in the results (shouldn't be, but just in case)
-                    local_found = any(device['ip'] == local_info['ip'] for device in devices)
-                    if not local_found:
-                        devices.append(local_info)
-                
-                with self.lock:
-                    self.cache = devices
-                return devices
+            probed_devices = [
+                device for device in probe_results
+                if device and device.get("mac")
+            ]
+            devices = self.read_neighbor_table() + probed_devices
+
+            # Add local machine to the results
+            local_info = self.get_local_machine_info()
+            if local_info:
+                local_found = any(device['ip'] == local_info['ip'] for device in devices)
+                if not local_found:
+                    devices.append(local_info)
+
+            self.remember_devices(devices, "scan")
+            with self.lock:
+                self.last_scan = {
+                    "timestamp": time.time(),
+                    "duration": round(time.time() - started, 3),
+                    "interface": interface,
+                    "localIP": local_ip,
+                    "netmask": netmask,
+                    "probed": len(ips),
+                    "probeReplies": sum(1 for result in probe_results if result),
+                    "neighbors": len(devices),
+                    "cacheSize": len(self.cache),
+                    "method": "arping+neighbor" if shutil.which("arping") else "ping+neighbor",
+                }
+            return self.get_cached_results()
         except Exception as e:
             print(f"Error reading ARP table: {e}")
             
         return []
+
+    def lookup(self, ip: str) -> Optional[Dict[str, object]]:
+        """Resolve a single IP address, probing before reading the cache."""
+        try:
+            socket.inet_aton(ip)
+        except OSError:
+            return None
+
+        network_info = self.get_local_network()
+        interface = network_info[2] if network_info else None
+        probed_device = self.arp_probe_device(ip, interface)
+
+        try:
+            devices = [device for device in self.read_neighbor_table() if device["ip"] == ip]
+        except Exception as e:
+            log.warning("Failed reading neighbor table for lookup %s: %s", ip, e)
+            devices = []
+
+        if probed_device and probed_device.get("mac"):
+            devices.append(probed_device)
+
+        if devices:
+            self.remember_devices(devices, "lookup")
+
+        with self.lock:
+            self.expire_cache_locked()
+            return self.cache.get(ip)
     
-    def get_cached_results(self) -> List[Dict[str, str]]:
+    def get_cached_results(self) -> List[Dict[str, object]]:
         """Get cached scan results"""
         with self.lock:
-            return self.cache.copy()
+            self.expire_cache_locked()
+            return sorted(
+                (device.copy() for device in self.cache.values()),
+                key=lambda device: str(device["ip"])
+            )
+
+    def diagnostics(self) -> Dict[str, object]:
+        """Return service diagnostics useful to clients and troubleshooting."""
+        network_info = self.get_local_network()
+        with self.lock:
+            self.expire_cache_locked()
+            return {
+                "network": {
+                    "ip": network_info[0] if network_info else None,
+                    "netmask": network_info[1] if network_info else None,
+                    "interface": network_info[2] if network_info else None,
+                },
+                "cacheSize": len(self.cache),
+                "cacheTTL": self.cache_ttl,
+                "lastScan": self.last_scan,
+                "hasArping": shutil.which("arping") is not None,
+            }
 
 class ScanHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the scan API"""
@@ -249,17 +404,51 @@ class ScanHandler(BaseHTTPRequestHandler):
     
     def do_GET(self):
         """Handle GET requests"""
-        if self.path == '/scan':
+        parsed = urlparse(self.path)
+
+        if parsed.path == '/scan':
+            query = parse_qs(parsed.query)
+            force = query.get("force", ["0"])[0].lower() in ("1", "true", "yes")
+            results = self.scanner.scan() if force else self.scanner.get_cached_results()
+            diagnostics = self.scanner.diagnostics()
+
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             
-            results = self.scanner.get_cached_results()
             response = {
                 "status": "success",
                 "count": len(results),
-                "devices": results
+                "devices": results,
+                "diagnostics": diagnostics,
+            }
+            self.wfile.write(json.dumps(response, indent=2).encode())
+        elif parsed.path == '/lookup':
+            query = parse_qs(parsed.query)
+            ip = query.get("ip", [""])[0]
+            result = self.scanner.lookup(ip) if ip else None
+
+            self.send_response(200 if result else 404)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            response = {
+                "status": "success" if result else "not_found",
+                "device": result,
+                "diagnostics": self.scanner.diagnostics(),
+            }
+            self.wfile.write(json.dumps(response, indent=2).encode())
+        elif parsed.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            response = {
+                "status": "ok",
+                "diagnostics": self.scanner.diagnostics(),
             }
             self.wfile.write(json.dumps(response, indent=2).encode())
         else:

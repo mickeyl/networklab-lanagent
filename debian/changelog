@@ -1,3 +1,11 @@
+lanagent (0.1.1-1) unstable; urgency=medium
+
+  * Add targeted MAC lookup, health diagnostics, forced scans, and TTL caching.
+  * Improve Linux ARP resolution by parsing arping replies directly.
+  * Normalize MAC address formats from platform ARP output.
+
+ -- Dr. Mickey Lauer <mickey@example.com>  Mon, 25 May 2026 11:45:00 +0200
+
 lanagent (0.1.0-1) unstable; urgency=medium
 
   * Initial Debian packaging for LANAgent with systemd integration.

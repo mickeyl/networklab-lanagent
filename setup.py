@@ -11,7 +11,7 @@ with open(os.path.join(this_directory, 'README.md'), encoding='utf-8') as f:
 
 setup(
     name='lanagent',
-    version='0.1.0',
+    version='0.1.1',
     author='Dr. Mickey Lauer',
     author_email='',  # Add your email when ready
     description='A network discovery service that scans local networks and exposes results via JSON API',
