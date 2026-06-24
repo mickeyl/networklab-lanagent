@@ -9,8 +9,14 @@ Type=simple
 User=lanagent
 Group=lanagent
 WorkingDirectory=/var/lib/lanagent
-ExecStart=/usr/bin/lanagent --port ${LANAGENT_PORT}
+ExecStart=/usr/bin/lanagent --port ${LANAGENT_PORT} --scan-interval ${LANAGENT_SCAN_INTERVAL} --presence-grace ${LANAGENT_PRESENCE_GRACE} --sleep-grace ${LANAGENT_SLEEP_GRACE} --miss-count ${LANAGENT_MISS_COUNT} --min-probe-completeness ${LANAGENT_MIN_PROBE_COMPLETENESS} --resume-gap ${LANAGENT_RESUME_GAP}
 Environment=LANAGENT_PORT=0
+Environment=LANAGENT_SCAN_INTERVAL=60
+Environment=LANAGENT_PRESENCE_GRACE=1800
+Environment=LANAGENT_SLEEP_GRACE=43200
+Environment=LANAGENT_MISS_COUNT=3
+Environment=LANAGENT_MIN_PROBE_COMPLETENESS=0.35
+Environment=LANAGENT_RESUME_GAP=300
 EnvironmentFile=-/etc/lanagent/lanagent.conf
 Restart=on-failure
 RestartSec=5

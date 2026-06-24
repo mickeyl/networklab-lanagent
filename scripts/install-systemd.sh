@@ -34,4 +34,4 @@ fi
 systemctl daemon-reload
 systemctl enable --now lanagent.service
 
-echo "LANAgent systemd service installed. Adjust ${ENV_FILE} to change the listening port."
+echo "LANAgent systemd service installed. Adjust ${ENV_FILE} to change the listening port and scan/presence settings."

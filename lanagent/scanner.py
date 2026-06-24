@@ -4,6 +4,7 @@ ARP Scanner Service
 Exposes network scan results via JSON API and publishes via Zeroconf
 """
 
+import ipaddress
 import json
 import logging
 import re
@@ -19,10 +20,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from .presence import PresenceMonitor
+
 log = logging.getLogger("lanagent")
 
 try:
-    from zeroconf import ServiceInfo, Zeroconf
+    from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf
 except ImportError:
     print("Please install zeroconf: pip3 install zeroconf")
     sys.exit(1)
@@ -33,12 +36,147 @@ except ImportError:
     print("Please install netifaces: pip3 install netifaces")
     sys.exit(1)
 
+
+class BonjourPresenceBrowser:
+    """Collects IPv4 addresses seen through Bonjour/mDNS service browsing."""
+
+    SERVICE_TYPES = (
+        "_device-info._tcp.local.",
+        "_rfb._tcp.local.",
+        "_smb._tcp.local.",
+        "_ssh._tcp.local.",
+        "_afpovertcp._tcp.local.",
+        "_companion-link._tcp.local.",
+        "_airplay._tcp.local.",
+        "_raop._tcp.local.",
+        "_homekit._tcp.local.",
+        "_hap._tcp.local.",
+        "_http._tcp.local.",
+        "_ipp._tcp.local.",
+        "_printer._tcp.local.",
+        "_googlecast._tcp.local.",
+        "_hue._tcp.local.",
+        "_adisk._tcp.local.",
+        "_sleep-proxy._udp.local.",
+    )
+
+    def __init__(self, zeroconf: Zeroconf, service_types: Optional[Tuple[str, ...]] = None):
+        self.zeroconf = zeroconf
+        self.service_types = service_types or self.SERVICE_TYPES
+        self.instances: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+        self.browsers: List[ServiceBrowser] = []
+        self.errors: List[str] = []
+        self.lock = threading.RLock()
+
+        for service_type in self.service_types:
+            try:
+                self.browsers.append(ServiceBrowser(self.zeroconf, service_type, self))
+            except Exception as e:
+                self._record_error(f"{service_type}: {e}")
+
+    def add_service(self, zeroconf: Zeroconf, service_type: str, name: str) -> None:
+        self._refresh_service(zeroconf, service_type, name)
+
+    def update_service(self, zeroconf: Zeroconf, service_type: str, name: str) -> None:
+        self._refresh_service(zeroconf, service_type, name)
+
+    def remove_service(self, zeroconf: Zeroconf, service_type: str, name: str) -> None:
+        with self.lock:
+            self.instances.pop((service_type, name), None)
+
+    def _refresh_service(self, zeroconf: Zeroconf, service_type: str, name: str) -> None:
+        try:
+            info = zeroconf.get_service_info(service_type, name, timeout=1000)
+        except Exception as e:
+            self._record_error(f"{service_type} {name}: {e}")
+            return
+        if not info:
+            return
+
+        devices = []
+        hostname = str(getattr(info, "server", "") or name).rstrip(".")
+        for address in self._parsed_ipv4_addresses(info):
+            devices.append({
+                "ip": address,
+                "mac": "",
+                "hostname": hostname,
+                "source": "bonjour",
+            })
+
+        with self.lock:
+            if devices:
+                self.instances[(service_type, name)] = devices
+            else:
+                self.instances.pop((service_type, name), None)
+
+    def _parsed_ipv4_addresses(self, info: ServiceInfo) -> List[str]:
+        addresses: List[str] = []
+        try:
+            parsed = info.parsed_addresses()
+        except Exception:
+            parsed = []
+            for raw in getattr(info, "addresses", []) or []:
+                if len(raw) == 4:
+                    try:
+                        parsed.append(socket.inet_ntoa(raw))
+                    except OSError:
+                        pass
+
+        for address in parsed:
+            try:
+                ip = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if not isinstance(ip, ipaddress.IPv4Address):
+                continue
+            if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+                continue
+            addresses.append(str(ip))
+        return sorted(set(addresses))
+
+    def snapshot(self) -> List[Dict[str, object]]:
+        with self.lock:
+            by_ip: Dict[str, Dict[str, object]] = {}
+            for devices in self.instances.values():
+                for device in devices:
+                    ip = str(device.get("ip", ""))
+                    if ip:
+                        by_ip[ip] = device.copy()
+            return sorted(by_ip.values(), key=lambda device: str(device.get("ip", "")))
+
+    def diagnostics(self) -> Dict[str, object]:
+        with self.lock:
+            return {
+                "enabled": True,
+                "serviceTypes": len(self.service_types),
+                "activeServices": len(self.instances),
+                "devices": len(self.snapshot()),
+                "errors": self.errors[-10:],
+            }
+
+    def close(self) -> None:
+        for browser in self.browsers:
+            cancel = getattr(browser, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
+
+    def _record_error(self, message: str) -> None:
+        log.debug("Bonjour browser error: %s", message)
+        with self.lock:
+            self.errors.append(message)
+            self.errors = self.errors[-50:]
+
+
 class ARPScanner:
     """Handles ARP scanning to discover devices on the local network"""
     
     def __init__(self):
         self.cache: Dict[str, Dict[str, object]] = {}
         self.last_scan: Optional[Dict[str, object]] = None
+        self.last_observed_devices: List[Dict[str, object]] = []
         self.lock = threading.Lock()
         self.cache_ttl = 30 * 60
         
@@ -277,6 +415,21 @@ class ARPScanner:
                 }
             self.expire_cache_locked(now)
 
+    def dedupe_devices(self, devices: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Collapse duplicate observations from neighbor table and active probes."""
+        by_key: Dict[str, Dict[str, str]] = {}
+        for device in devices:
+            ip = device.get("ip", "")
+            mac = device.get("mac", "")
+            key = mac or ip
+            if not key:
+                continue
+            existing = by_key.get(key)
+            if existing and existing.get("mac"):
+                continue
+            by_key[key] = {"ip": ip, "mac": mac}
+        return list(by_key.values())
+
     def expire_cache_locked(self, now: Optional[float] = None) -> None:
         now = now or time.time()
         expired = [
@@ -291,6 +444,8 @@ class ARPScanner:
         started = time.time()
         network_info = self.get_local_network()
         if not network_info:
+            with self.lock:
+                self.last_observed_devices = []
             return []
 
         local_ip, netmask, interface = network_info
@@ -324,8 +479,17 @@ class ARPScanner:
                 if not local_found:
                     devices.append(local_info)
 
+            devices = self.dedupe_devices(devices)
             self.remember_devices(devices, "scan")
             with self.lock:
+                self.last_observed_devices = [
+                    {
+                        "ip": device["ip"],
+                        "mac": device["mac"],
+                        "source": "scan",
+                    }
+                    for device in devices
+                ]
                 self.last_scan = {
                     "timestamp": time.time(),
                     "duration": round(time.time() - started, 3),
@@ -341,6 +505,8 @@ class ARPScanner:
             return self.get_cached_results()
         except Exception as e:
             print(f"Error reading ARP table: {e}")
+            with self.lock:
+                self.last_observed_devices = []
             
         return []
 
@@ -380,6 +546,11 @@ class ARPScanner:
                 key=lambda device: str(device["ip"])
             )
 
+    def get_last_observed_results(self) -> List[Dict[str, object]]:
+        """Get the devices observed by the latest probe, without TTL cache smoothing."""
+        with self.lock:
+            return [device.copy() for device in self.last_observed_devices]
+
     def diagnostics(self) -> Dict[str, object]:
         """Return service diagnostics useful to clients and troubleshooting."""
         network_info = self.get_local_network()
@@ -401,6 +572,7 @@ class ScanHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the scan API"""
     
     scanner: ARPScanner = None
+    service = None
     
     def do_GET(self):
         """Handle GET requests"""
@@ -409,8 +581,8 @@ class ScanHandler(BaseHTTPRequestHandler):
         if parsed.path == '/scan':
             query = parse_qs(parsed.query)
             force = query.get("force", ["0"])[0].lower() in ("1", "true", "yes")
-            results = self.scanner.scan() if force else self.scanner.get_cached_results()
-            diagnostics = self.scanner.diagnostics()
+            results = self.service.scan_once() if force else self.scanner.get_cached_results()
+            diagnostics = self.service.diagnostics()
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -422,6 +594,47 @@ class ScanHandler(BaseHTTPRequestHandler):
                 "count": len(results),
                 "devices": results,
                 "diagnostics": diagnostics,
+            }
+            self.wfile.write(json.dumps(response, indent=2).encode())
+        elif parsed.path == '/presence':
+            query = parse_qs(parsed.query)
+            include_absent = query.get("includeAbsent", ["0"])[0].lower() in ("1", "true", "yes")
+            results = self.service.presence.snapshot(include_absent=include_absent)
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            response = {
+                "status": "success",
+                "count": len(results),
+                "devices": results,
+                "diagnostics": self.service.diagnostics(),
+            }
+            self.wfile.write(json.dumps(response, indent=2).encode())
+        elif parsed.path == '/events':
+            query = parse_qs(parsed.query)
+            try:
+                since = int(query.get("since", ["0"])[0])
+            except ValueError:
+                since = 0
+            try:
+                limit = int(query.get("limit", ["200"])[0])
+            except ValueError:
+                limit = 200
+            events = self.service.presence.events_since(since=since, limit=limit)
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            response = {
+                "status": "success",
+                "count": len(events),
+                "events": events,
+                "diagnostics": self.service.diagnostics(),
             }
             self.wfile.write(json.dumps(response, indent=2).encode())
         elif parsed.path == '/lookup':
@@ -437,7 +650,7 @@ class ScanHandler(BaseHTTPRequestHandler):
             response = {
                 "status": "success" if result else "not_found",
                 "device": result,
-                "diagnostics": self.scanner.diagnostics(),
+                "diagnostics": self.service.diagnostics(),
             }
             self.wfile.write(json.dumps(response, indent=2).encode())
         elif parsed.path == '/health':
@@ -448,7 +661,7 @@ class ScanHandler(BaseHTTPRequestHandler):
 
             response = {
                 "status": "ok",
-                "diagnostics": self.scanner.diagnostics(),
+                "diagnostics": self.service.diagnostics(),
             }
             self.wfile.write(json.dumps(response, indent=2).encode())
         else:
@@ -461,12 +674,31 @@ class ScanHandler(BaseHTTPRequestHandler):
 class ARPScannerService:
     """Main service class that manages HTTP server and Zeroconf"""
     
-    def __init__(self, port: int = 0):
+    def __init__(
+        self,
+        port: int = 0,
+        scan_interval: int = 60,
+        presence_grace: float = 1800,
+        sleep_grace: float = 12 * 3600,
+        miss_count: int = 3,
+        min_probe_completeness: float = 0.35,
+        resume_gap: float = 300,
+    ):
         self.scanner = ARPScanner()
+        self.presence = PresenceMonitor(
+            grace=presence_grace,
+            sleep_grace=sleep_grace,
+            miss_count=miss_count,
+            min_probe_completeness=min_probe_completeness,
+            resume_gap=resume_gap,
+            cadence=scan_interval,
+        )
         self.port = port
+        self.scan_interval = scan_interval
         self.server = None
         self.zeroconf = None
         self.service_info = None
+        self.bonjour: Optional[BonjourPresenceBrowser] = None
         
     def find_free_port(self) -> int:
         """Find an available TCP port"""
@@ -482,6 +714,7 @@ class ARPScannerService:
             self.port = self.find_free_port()
         
         ScanHandler.scanner = self.scanner
+        ScanHandler.service = self
         self.server = ThreadingHTTPServer(('0.0.0.0', self.port), ScanHandler)
         
         print(f"HTTP server started on port {self.port}")
@@ -518,15 +751,36 @@ class ARPScannerService:
             properties={
                 "version": "1.0",
                 "path": "/scan",
+                "presencePath": "/presence",
+                "eventsPath": "/events",
                 "description": "LAN Agent network scanner with JSON API",
                 "hostname": hostname
             }
         )
         
         self.zeroconf.register_service(self.service_info)
+        self.bonjour = BonjourPresenceBrowser(self.zeroconf)
         print(f"Service registered via Zeroconf as: {service_name}")
         print(f"Service type: {service_type}")
         print(f"IP address: {local_ip}")
+        print(f"Browsing {len(self.bonjour.service_types)} Bonjour types for presence")
+
+    def scan_once(self) -> List[Dict[str, object]]:
+        """Run one scan cycle and feed ARP plus Bonjour observations into presence state."""
+        results = self.scanner.scan()
+        observed = self.scanner.get_last_observed_results()
+        if self.bonjour:
+            observed.extend(self.bonjour.snapshot())
+        self.presence.update(observed)
+        return results
+
+    def diagnostics(self) -> Dict[str, object]:
+        return {
+            "scanner": self.scanner.diagnostics(),
+            "presence": self.presence.diagnostics(),
+            "bonjour": self.bonjour.diagnostics() if self.bonjour else {"enabled": False},
+            "scanInterval": self.scan_interval,
+        }
     
     def periodic_scan(self):
         """Perform periodic network scans.
@@ -538,11 +792,11 @@ class ARPScannerService:
         while True:
             try:
                 log.info("Performing network scan...")
-                devices = self.scanner.scan()
+                devices = self.scan_once()
                 log.info("Found %d devices", len(devices))
             except Exception:
                 log.exception("Periodic scan failed; keeping previous cache")
-            time.sleep(60)
+            time.sleep(self.scan_interval)
     
     def run(self):
         """Main service loop"""
@@ -560,7 +814,7 @@ class ARPScannerService:
             
             # Do initial scan
             print("Performing initial scan...")
-            devices = self.scanner.scan()
+            devices = self.scan_once()
             print(f"Initial scan found {len(devices)} devices")
             
             # Start periodic scanning
@@ -578,6 +832,8 @@ class ARPScannerService:
         finally:
             if self.server:
                 self.server.shutdown()
+            if self.bonjour:
+                self.bonjour.close()
             if self.zeroconf and self.service_info:
                 self.zeroconf.unregister_service(self.service_info)
                 self.zeroconf.close()

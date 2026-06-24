@@ -9,6 +9,7 @@ LANAgent is a lightweight network discovery service that scans your local networ
 
 - 🔍 **Network Discovery**: Automatically discovers devices on your local network using ARP
 - 🌐 **JSON API**: HTTP endpoints for cached scans, forced scans, targeted MAC lookups, and health diagnostics
+- 📈 **Presence Monitoring**: Tracks current presence and sequenced join/leave/back-online events from ARP and Bonjour observations
 - 📡 **Zeroconf/mDNS**: Automatic service discovery via Bonjour/Avahi
 - 🔄 **Periodic Scanning**: Continuously updates device list every 60 seconds
 - 🖥️ **Cross-Platform**: Works on macOS and Linux
@@ -65,6 +66,7 @@ The service will:
 2. Register itself via Zeroconf as `_lanagent._tcp.local.`
 3. Perform an initial network scan
 4. Continue scanning every 60 seconds
+5. Derive presence state and event history from ARP and Bonjour observations
 
 ### API Endpoints
 
@@ -90,6 +92,24 @@ Inspect the agent health and scan diagnostics:
 
 ```bash
 curl http://localhost:<port>/health
+```
+
+Inspect current presence state:
+
+```bash
+curl http://localhost:<port>/presence
+```
+
+Include absent devices that are still known:
+
+```bash
+curl "http://localhost:<port>/presence?includeAbsent=1"
+```
+
+Fetch presence events after a sequence number:
+
+```bash
+curl "http://localhost:<port>/events?since=42&limit=200"
 ```
 
 Response format:
@@ -127,6 +147,49 @@ Response format:
     },
     "hasArping": true
   }
+}
+```
+
+Presence response format:
+```json
+{
+  "status": "success",
+  "count": 1,
+  "devices": [
+    {
+      "key": "AA:BB:CC:DD:EE:FF",
+      "ip": "192.168.1.100",
+      "mac": "AA:BB:CC:DD:EE:FF",
+      "firstSeen": 1779700123.0,
+      "lastSeen": 1779700423.0,
+      "present": true,
+      "misses": 0,
+      "source": "scan",
+      "sleepTolerant": false
+    }
+  ]
+}
+```
+
+Events response format:
+```json
+{
+  "status": "success",
+  "count": 1,
+  "events": [
+    {
+      "sequence": 43,
+      "timestamp": 1779700423.0,
+      "type": "back_online",
+      "device": {
+        "key": "AA:BB:CC:DD:EE:FF",
+        "ip": "192.168.1.100",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "present": true,
+        "awayFor": 3600
+      }
+    }
+  ]
 }
 ```
 
@@ -181,7 +244,8 @@ browser = ServiceBrowser(zeroconf, "_lanagent._tcp.local.", Listener())
    - On Linux: Uses `ip neigh show` command
 4. **Targeted Lookup**: `/lookup?ip=...` actively probes one host before reading the neighbor cache
 5. **Result Caching**: Maintains a thread-safe TTL cache of discovered devices so transient weak scans do not erase recent MAC mappings
-6. **API Serving**: Exposes results via HTTP with CORS enabled for web access
+6. **Presence State**: Converts raw ARP and Bonjour observations into stable device state and sequenced events, suppressing leave events during degraded probes
+7. **API Serving**: Exposes results via HTTP with CORS enabled for web access
 
 ## Platform Support
 
@@ -192,7 +256,7 @@ browser = ServiceBrowser(zeroconf, "_lanagent._tcp.local.", Listener())
 ## Security Considerations
 
 - The service binds to `0.0.0.0` by default, making it accessible from any network interface
-- No authentication is required to access the `/scan` endpoint
+- No authentication is required to access the JSON API endpoints
 - Only performs read-only network discovery (no active exploitation)
 - For production use, consider:
   - Binding to localhost only (`127.0.0.1`)
