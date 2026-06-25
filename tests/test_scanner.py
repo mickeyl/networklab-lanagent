@@ -20,6 +20,7 @@ sys.modules.setdefault(
 )
 
 from lanagent.presence import PresenceMonitor
+from lanagent.monitor import format_event
 from lanagent.scanner import ARPScanner, BonjourPresenceBrowser
 
 
@@ -192,6 +193,25 @@ class PresenceMonitorTests(unittest.TestCase):
         self.assertEqual(snapshot[0]["source"], "bonjour")
         self.assertEqual(snapshot[0]["sleepTolerant"], True)
 
+    def test_later_arp_mac_promotes_existing_bonjour_ip_record(self):
+        monitor = PresenceMonitor(grace=10, sleep_grace=100, miss_count=1)
+
+        monitor.update([
+            {"ip": "192.168.1.40", "mac": "", "source": "bonjour", "hostname": "host.local"},
+        ], now=100)
+        monitor.update([
+            {"ip": "192.168.1.40", "mac": "AA:BB:CC:DD:EE:40", "source": "scan"},
+            {"ip": "192.168.1.40", "mac": "", "source": "bonjour", "hostname": "host.local"},
+        ], now=160)
+
+        snapshot = monitor.snapshot()
+        self.assertEqual(len(snapshot), 1)
+        self.assertEqual(snapshot[0]["key"], "AA:BB:CC:DD:EE:40")
+        self.assertEqual(snapshot[0]["ip"], "192.168.1.40")
+        self.assertEqual(snapshot[0]["mac"], "AA:BB:CC:DD:EE:40")
+        self.assertEqual(snapshot[0]["source"], "scan+bonjour")
+        self.assertEqual(snapshot[0]["sleepTolerant"], True)
+
 
 class BonjourPresenceBrowserTests(unittest.TestCase):
 
@@ -211,6 +231,36 @@ class BonjourPresenceBrowserTests(unittest.TestCase):
         snapshot = browser.snapshot()
 
         self.assertEqual([device["ip"] for device in snapshot], ["192.168.1.20", "192.168.1.21"])
+
+
+class MonitorFormattingTests(unittest.TestCase):
+
+    def test_formats_join_and_left_events(self):
+        joined = format_event({
+            "timestamp": 100,
+            "type": "joined",
+            "device": {
+                "ip": "192.168.1.20",
+                "mac": "AA:BB:CC:DD:EE:20",
+                "hostname": "host.local",
+                "source": "scan+bonjour",
+            },
+        })
+        left = format_event({
+            "timestamp": 120,
+            "type": "left",
+            "device": {
+                "ip": "192.168.1.20",
+                "mac": "AA:BB:CC:DD:EE:20",
+                "goneFor": 1800,
+            },
+        })
+
+        self.assertIn("+ 192.168.1.20", joined)
+        self.assertIn("host.local", joined)
+        self.assertIn("joined (Bonjour)", joined)
+        self.assertIn("- 192.168.1.20", left)
+        self.assertIn("left (gone 1800s)", left)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,7 @@ class PresenceMonitor:
             self.last_update_started = now
 
             observed = self._observed_by_key(devices)
+            self._promote_ip_records(observed)
             seen_keys = set(observed)
             present_before = {key for key, record in self.records.items() if record.get("present")}
             expected = len(present_before)
@@ -209,6 +210,54 @@ class PresenceMonitor:
             return None
         for key, record in self.records.items():
             if record.get("ip") == ip:
+                return key
+        return None
+
+    def _promote_ip_records(self, observed: Dict[str, Dict[str, object]]) -> None:
+        """Move an existing IP-keyed Bonjour record to its later MAC-keyed identity."""
+        promotions = [
+            (key, str(device.get("ip", "")), str(device.get("mac", "")))
+            for key, device in observed.items()
+            if device.get("ip") and device.get("mac") and key == device.get("mac")
+        ]
+        for target_key, ip, mac in promotions:
+            old_key = self._known_ip_only_key_for_ip(ip, excluding=target_key)
+            if not old_key:
+                continue
+            old_record = self.records.pop(old_key)
+            target_record = self.records.get(target_key)
+            if target_record is None:
+                old_record["key"] = target_key
+                old_record["mac"] = mac
+                old_record["source"] = self._merge_sources(str(old_record.get("source", "")), str(observed[target_key].get("source", "")))
+                if observed[target_key].get("hostname"):
+                    old_record["hostname"] = observed[target_key].get("hostname", "")
+                old_record["sleepTolerant"] = bool(old_record.get("sleepTolerant")) or self._is_sleep_tolerant(observed[target_key])
+                self.records[target_key] = old_record
+                continue
+
+            target_record["firstSeen"] = min(
+                float(target_record.get("firstSeen", 0)),
+                float(old_record.get("firstSeen", target_record.get("firstSeen", 0))),
+            )
+            target_record["lastSeen"] = max(
+                float(target_record.get("lastSeen", 0)),
+                float(old_record.get("lastSeen", target_record.get("lastSeen", 0))),
+            )
+            target_record["present"] = bool(target_record.get("present")) or bool(old_record.get("present"))
+            target_record["misses"] = min(int(target_record.get("misses", 0)), int(old_record.get("misses", 0)))
+            target_record["sleepTolerant"] = bool(target_record.get("sleepTolerant")) or bool(old_record.get("sleepTolerant"))
+            if not target_record.get("hostname") and old_record.get("hostname"):
+                target_record["hostname"] = old_record.get("hostname", "")
+            target_record["source"] = self._merge_sources(str(target_record.get("source", "")), str(old_record.get("source", "")))
+
+    def _known_ip_only_key_for_ip(self, ip: str, excluding: str) -> Optional[str]:
+        for key, record in self.records.items():
+            if key == excluding:
+                continue
+            if key != ip:
+                continue
+            if record.get("ip") == ip and not record.get("mac"):
                 return key
         return None
 

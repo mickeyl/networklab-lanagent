@@ -55,10 +55,28 @@ Start the service:
 lanagent
 ```
 
+Or explicitly:
+
+```bash
+lanagent serve
+```
+
 Or run with a specific port:
 
 ```bash
 lanagent --port 8080
+```
+
+Follow presence events from a discovered LANAgent:
+
+```bash
+lanagent monitor
+```
+
+Follow a specific agent and replay stored events:
+
+```bash
+lanagent monitor --url http://meteor:38335 --replay
 ```
 
 The service will:

@@ -6,6 +6,7 @@ Command-line interface for LANAgent service.
 import argparse
 import sys
 from importlib.metadata import PackageNotFoundError, version
+from .monitor import main as monitor_main
 from .scanner import ARPScannerService
 
 
@@ -16,14 +17,15 @@ def package_version() -> str:
         return "0.0.0"
 
 
-def main():
-    """Main CLI entry point."""
+def build_serve_parser(prog: str = "lanagent") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='LANAgent - Network discovery service with JSON API',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   lanagent                    # Start with auto-selected port
+  lanagent serve              # Explicitly start the service
+  lanagent monitor            # Follow presence events from a discovered LANAgent
   lanagent --port 8080        # Start on specific port
   lanagent -p 8080           # Short form
 
@@ -34,6 +36,7 @@ The service will:
   - Expose scan, presence, event, lookup, and health JSON APIs
         """
     )
+    parser.prog = prog
     
     parser.add_argument(
         '-p', '--port',
@@ -89,9 +92,78 @@ The service will:
         action='version',
         version=f'%(prog)s {package_version()}'
     )
-    
-    args = parser.parse_args()
-    
+    return parser
+
+
+def build_monitor_parser(prog: str = "lanagent monitor") -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Follow LANAgent presence events",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  lanagent monitor
+  lanagent monitor --url http://meteor:38335
+  lanagent monitor --host meteor --port 38335 --replay
+
+By default, the monitor discovers _lanagent._tcp.local. via Zeroconf and starts
+at the current event sequence. Use --replay or --since to print historical events.
+        """,
+    )
+    parser.add_argument("--url", help="LANAgent base URL, for example http://meteor:38335")
+    parser.add_argument("--host", help="LANAgent host when not using --url or Zeroconf discovery")
+    parser.add_argument("--port", type=int, help="LANAgent port when using --host")
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=5,
+        help="Seconds between event polls (default: 5)",
+    )
+    parser.add_argument(
+        "--since",
+        type=int,
+        help="Only print events after this sequence number",
+    )
+    parser.add_argument(
+        "--replay",
+        action="store_true",
+        help="Replay stored events from sequence 0 instead of starting at the current tail",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Print currently available events and exit",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=500,
+        help="Maximum events to fetch per poll (default: 500)",
+    )
+    parser.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=5,
+        help="Seconds to wait for Zeroconf discovery when no URL is provided (default: 5)",
+    )
+    return parser
+
+
+def main():
+    """Main CLI entry point."""
+    argv = sys.argv[1:]
+    if argv and argv[0] == "monitor":
+        parser = build_monitor_parser()
+        args = parser.parse_args(argv[1:])
+        sys.exit(monitor_main(args))
+
+    if argv and argv[0] == "serve":
+        parser = build_serve_parser("lanagent serve")
+        args = parser.parse_args(argv[1:])
+    else:
+        parser = build_serve_parser()
+        args = parser.parse_args(argv)
+
     try:
         service = ARPScannerService(
             port=args.port,
