@@ -85,6 +85,24 @@ class ARPScannerTests(unittest.TestCase):
 
         self.assertEqual(devices, [{"ip": "192.168.1.129", "mac": "9C:76:0E:52:10:38"}])
 
+    def test_ignores_non_ipv4_neighbor_entries(self):
+        scanner = ARPScanner()
+        output = "\n".join([
+            "192.168.1.129 dev eth0 lladdr 9c:76:0e:52:10:38 REACHABLE",
+            "fe80::1087:e5f2:64a6:6bf4 dev eth0 lladdr a8:51:ab:10:fc:28 STALE",
+            "fd51:b9e7:83a1:4797:10da:24bb:b00a:ec0f dev eth0 lladdr 9c:76:0e:52:10:38 STALE",
+            "169.254.10.20 dev eth0 lladdr aa:bb:cc:dd:ee:ff STALE",
+        ])
+
+        original_platform = sys.platform
+        try:
+            sys.platform = "linux"
+            devices = scanner.parse_arp_output(output)
+        finally:
+            sys.platform = original_platform
+
+        self.assertEqual(devices, [{"ip": "192.168.1.129", "mac": "9C:76:0E:52:10:38"}])
+
     def test_parses_arping_mac_addresses(self):
         scanner = ARPScanner()
         output = "Unicast reply from 192.168.1.109 [A8:51:AB:10:FC:28]  0.798ms"

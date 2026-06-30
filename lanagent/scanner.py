@@ -341,6 +341,8 @@ class ARPScanner:
                 parts = line.split()
                 if len(parts) >= 4 and parts[2] == "at":
                     ip = parts[1].strip('()')
+                    if not self.is_usable_ipv4(ip):
+                        continue
                     mac = self.normalize_mac(parts[3])
                     if mac:
                         devices.append({"ip": ip, "mac": mac})
@@ -349,6 +351,8 @@ class ARPScanner:
                 parts = line.split()
                 if len(parts) >= 5 and "lladdr" in parts:
                     ip = parts[0]
+                    if not self.is_usable_ipv4(ip):
+                        continue
                     lladdr_idx = parts.index("lladdr")
                     if lladdr_idx + 1 < len(parts):
                         mac = self.normalize_mac(parts[lladdr_idx + 1])
@@ -381,6 +385,21 @@ class ARPScanner:
     def is_valid_mac(self, mac: str) -> bool:
         """Validate MAC address format"""
         return self.normalize_mac(mac) is not None
+
+    def is_usable_ipv4(self, ip: str) -> bool:
+        """Return whether an address belongs in IPv4 LAN scan results."""
+        try:
+            address = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        if not isinstance(address, ipaddress.IPv4Address):
+            return False
+        return not (
+            address.is_loopback
+            or address.is_link_local
+            or address.is_unspecified
+            or address.is_multicast
+        )
 
     def read_neighbor_table(self) -> List[Dict[str, str]]:
         """Read the operating system's neighbor/ARP table."""
